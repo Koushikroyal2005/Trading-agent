@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from math import ceil
+from math import floor
 from uuid import uuid4
 
 import httpx
 
 from backend.infrastructure.circuit_breaker import CircuitBreaker
 from backend.models.domain.entities import MarketBar, Order, Portfolio, Position
+from backend.models.domain.exceptions import OrderRejectedError
 
 
 def alpaca_timeframe(minutes: int) -> str:
@@ -16,6 +19,13 @@ def alpaca_timeframe(minutes: int) -> str:
     if not 1 <= minutes <= 60:
         raise ValueError("timeframe must be between 1 and 60 minutes")
     return "1Hour" if minutes == 60 else f"{minutes}Min"
+
+
+def alpaca_price(value: float) -> str:
+    """Format equity prices to the minimum price variance allowed by Alpaca."""
+    decimal = Decimal(str(value))
+    increment = Decimal("0.01") if abs(decimal) >= 1 else Decimal("0.0001")
+    return format(decimal.quantize(increment, rounding=ROUND_HALF_UP), "f")
 
 
 class SimulatedBrokerClient:
@@ -72,23 +82,42 @@ class AlpacaBrokerClient:
             raise ValueError("Only Alpaca paper trading is permitted")
         self.base_url = base_url.rstrip("/").removesuffix("/v2")
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
-        self.breaker = CircuitBreaker()
+        self.breaker = CircuitBreaker(ignored_exceptions=(OrderRejectedError,))
 
     async def _request(self, method: str, path: str, **kwargs) -> dict | list:
         async def operation():
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.request(method, f"{self.base_url}/v2/{path.lstrip('/')}" , headers=self.headers, **kwargs)
+                if 400 <= response.status_code < 500:
+                    try:
+                        body = response.json()
+                        message = str(body.get("message") or body)
+                        code = body.get("code")
+                    except ValueError:
+                        message, code = response.text[:300], None
+                    suffix = f" (code {code})" if code is not None else ""
+                    raise OrderRejectedError(
+                        f"Alpaca rejected {method} {path}: {message}{suffix}",
+                        status_code=response.status_code,
+                        code=code,
+                    )
                 response.raise_for_status()
                 return response.json() if response.content else {}
         return await self.breaker.call(operation)
 
     async def submit_order(self, order: Order) -> Order:
         order.client_order_id = order.client_order_id or f"vector-{order.id.hex[:32]}"
+        is_bracket = order.stop_loss is not None and order.take_profit is not None
+        if is_bracket:
+            whole_quantity = floor(order.quantity)
+            if whole_quantity < 1:
+                raise OrderRejectedError("Alpaca bracket orders require at least one whole share")
+            order.quantity = float(whole_quantity)
         payload = {"symbol": order.symbol, "qty": str(order.quantity), "side": order.side.value, "type": order.order_type.value, "time_in_force": "day", "client_order_id": order.client_order_id}
-        if order.limit_price is not None: payload["limit_price"] = str(order.limit_price)
-        if order.stop_price is not None: payload["stop_price"] = str(order.stop_price)
-        if order.stop_loss is not None and order.take_profit is not None:
-            payload.update({"order_class": "bracket", "take_profit": {"limit_price": str(order.take_profit)}, "stop_loss": {"stop_price": str(order.stop_loss)}})
+        if order.limit_price is not None: payload["limit_price"] = alpaca_price(order.limit_price)
+        if order.stop_price is not None: payload["stop_price"] = alpaca_price(order.stop_price)
+        if is_bracket:
+            payload.update({"order_class": "bracket", "take_profit": {"limit_price": alpaca_price(order.take_profit)}, "stop_loss": {"stop_price": alpaca_price(order.stop_loss)}})
         data = await self._request("POST", "orders", json=payload)
         order.broker_id = str(data["id"])
         order.status = str(data.get("status", "accepted"))
@@ -99,8 +128,10 @@ class AlpacaBrokerClient:
         try:
             await self._request("DELETE", f"orders/{order_id}")
             return True
-        except httpx.HTTPStatusError as error:
-            return error.response.status_code == 404
+        except OrderRejectedError as error:
+            if error.status_code == 404:
+                return False
+            raise
 
     async def cancel_all_orders(self) -> int:
         data = await self._request("DELETE", "orders")

@@ -10,7 +10,7 @@ from backend.services.orchestrator import TradingOrchestrator
 from backend.services.portfolio_service import PortfolioService
 from backend.services.system_state import SystemStateCaretaker
 from backend.storage.clients import AlpacaBrokerClient, GeminiReasoningClient, SimulatedBrokerClient
-from backend.storage.clients.alpaca_client import alpaca_timeframe
+from backend.storage.clients.alpaca_client import alpaca_price, alpaca_timeframe
 from backend.storage.repositories import TradingRepository
 from backend.strategies import default_registry
 from backend.utils.config import Settings
@@ -76,11 +76,18 @@ async def test_alpaca_submission_uses_idempotency_and_bracket_exits(monkeypatch)
         captured.update({"method": method, "path": path, "payload": kwargs["json"]})
         return {"id": "broker-1", "status": "accepted", "filled_avg_price": None}
     monkeypatch.setattr(client, "_request", fake_request)
-    order = await client.submit_order(Order(symbol="AAPL", side=Side.BUY, quantity=1, stop_loss=99, take_profit=103, data_source=MarketDataSource.ALPACA))
+    order = await client.submit_order(Order(symbol="AAPL", side=Side.BUY, quantity=5.0821, stop_loss=99.12345, take_profit=103.98765, data_source=MarketDataSource.ALPACA))
     assert order.client_order_id.startswith("vector-")
+    assert order.quantity == 5
+    assert captured["payload"]["qty"] == "5.0"
     assert captured["payload"]["order_class"] == "bracket"
-    assert captured["payload"]["stop_loss"]["stop_price"] == "99.0"
-    assert captured["payload"]["take_profit"]["limit_price"] == "103.0"
+    assert captured["payload"]["stop_loss"]["stop_price"] == "99.12"
+    assert captured["payload"]["take_profit"]["limit_price"] == "103.99"
+
+
+def test_alpaca_price_respects_minimum_price_variance():
+    assert alpaca_price(321.90142857142854) == "321.90"
+    assert alpaca_price(0.123456) == "0.1235"
 
 
 def test_alpaca_timeframe_uses_hour_unit_for_sixty_minutes():

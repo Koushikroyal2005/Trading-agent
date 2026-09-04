@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from backend.models.domain.entities import AgentEvent, MarketDataSource
+from backend.models.domain.exceptions import OrderRejectedError
 from backend.services.system_state import SystemStateCaretaker
 
 
@@ -65,7 +66,13 @@ class TradingOrchestrator:
         returns = [closes[index] / closes[index-1] - 1 for index in range(1, len(closes))]
         risk = await self.agents["risk"].process({"signal": signal, "portfolio": portfolio, "returns": returns})
         allowed, guard_reason = await self._execution_guard(snapshot) if execute else (False, "analysis-only cycle")
-        order = await self.agents["execution"].process({"signal": signal, "risk": risk, "data_source": snapshot.source}) if allowed else None
+        order = None
+        if allowed:
+            try:
+                order = await self.agents["execution"].process({"signal": signal, "risk": risk, "data_source": snapshot.source})
+            except OrderRejectedError as error:
+                allowed = False
+                guard_reason = str(error)
         policy = await self.agents["rl"].process({"snapshot": snapshot})
         self.cycles += 1
         self.last_snapshot, self.last_signal = snapshot, signal
