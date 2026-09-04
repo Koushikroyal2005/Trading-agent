@@ -1,0 +1,7 @@
+-r requirements.txt
+torch>=2.5,<3
+stable-baselines3>=2.5,<3
+chromadb>=1.0,<2
+sentence-transformers>=4,<6
+scikit-learn>=1.6,<2
+
