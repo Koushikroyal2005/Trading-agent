@@ -1,350 +1,472 @@
-# Vector Trading System Architecture
+# Vector Trading System - Software Architecture
 
-## 1. Scope
+> This document explains how the system is shaped internally, why the boundaries exist, and where to change it safely. For installation, configuration, commands, UI usage, and troubleshooting, use [README.md](../README.md).
 
-Vector is a multi-agent, paper-only trading system for 1-60 minute market intervals. It combines deterministic strategies, risk controls, Alpaca paper execution, Gemini Flash summaries, market-scenario retrieval, reinforcement learning, scheduled jobs, durable storage, and a real-time dashboard.
+## 1. Architectural thesis
 
-It targets a controlled single-machine demo/project deployment using Docker Compose and HDD-backed persistence. Live Alpaca endpoints are rejected. Enabling auto trade permits scheduled **paper** orders only after all strategy, risk, provenance, freshness, market-hours, duplicate-order, and broker checks pass.
+Vector is a modular monolith with background workers, not a collection of networked agent microservices. The decision agents live in one API process and are coordinated through typed domain objects. Celery provides scheduled triggers, Redis provides task transport, locking, and durable event capture, and TimescaleDB owns relational history.
 
-## 2. Architectural goals
+This shape is deliberate:
 
-- Keep domain and agent logic independent of FastAPI, Celery, Docker, and vendor SDKs.
-- Separate continuous analysis from explicitly enabled execution.
-- Preserve market data, events, orders, knowledge, learned weights, and safety state across restarts.
-- Bound failures using validation, timeouts, circuit breakers, task retries, and distributed locks.
-- Limit storage growth and write amplification for HDD operation.
-- Expose runtime state through REST, WebSocket, health checks, logs, and the dashboard.
+- One process owns trading state, preventing scheduler/API disagreement.
+- Agent classes stay independently testable without distributed-system overhead.
+- Vendor integrations remain replaceable adapters.
+- Analysis and execution are separate capabilities.
+- Safety invariants are enforced at multiple boundaries, not only in the UI.
 
-## 3. System context
+## 2. Runtime ownership
 
-```mermaid
-flowchart LR
-    USER[Operator / browser] -->|HTTP and WebSocket| UI[Next.js dashboard]
-    UI -->|REST| API[FastAPI application]
-    UI <-->|Market WebSocket| API
-    API --> ORCH[TradingOrchestrator]
-    ORCH --> AGENTS[Agent pipeline]
-    API --> REPO[TradingRepository]
-    API --> BUS[EventBus]
-    AGENTS -->|Bars, account, clock, orders| ALPACA[Alpaca paper APIs]
-    AGENTS -->|Concise JSON request| GEMINI[Gemini Flash]
-    AGENTS --> HDD[HDD knowledge and models]
-    REPO --> DB[(TimescaleDB)]
-    BUS --> REDIS[(Redis)]
-    BEAT[Celery Beat] --> WORKER[Celery worker]
-    WORKER -->|Internal HTTP| API
-```
-
-Alpaca, Gemini, and the browser are external trust boundaries. Alpaca credentials are accepted only with a paper API URL. Gemini receives a bounded market-analysis payload and returns a concise JSON decision summary; private model chain-of-thought is neither requested nor persisted.
-
-## 4. Deployment architecture
-
-```mermaid
-flowchart TB
-    subgraph HOST[Host machine - HDD storage]
-        ENV[.env]
-        DATA[HDD_STORAGE_PATH]
-        subgraph COMPOSE[Docker Compose: vector-trading]
-            FE[frontend - Next.js :3000]
-            API[api - FastAPI :8000]
-            WORKER[worker - Celery]
-            SCHED[scheduler - Celery Beat]
-            REDIS[redis - Redis 7.4]
-            DB[timescaledb - PostgreSQL 16]
-        end
-        DATA -->|postgres| DB
-        DATA -->|redis| REDIS
-        DATA -->|app data| API
-        DATA -->|app data| WORKER
-        DATA -->|app data| SCHED
-        ENV --> API
-        ENV --> WORKER
-        ENV --> SCHED
-    end
-    FE --> API
-    SCHED --> REDIS
-    REDIS --> WORKER
-    WORKER --> API
-    API --> REDIS
-    API --> DB
-```
-
-The frontend and API bind to `127.0.0.1:3000` and `127.0.0.1:8000`. Redis and TimescaleDB remain internal. Health dependencies start storage before the API and the API before worker-facing services. Containers use `restart: unless-stopped` and resource limits.
-
-The API owns the single in-memory orchestrator. Workers call it through the internal API instead of creating separate orchestrators. This prevents auto-trade, emergency-stop, cycle-count, and strategy state from diverging between processes.
-
-## 5. Layered component model
-
-```mermaid
-flowchart TB
-    subgraph INTERFACES[Interface adapters]
-        DASH[Next.js dashboard]
-        REST[FastAPI REST]
-        WS[WebSocketHub]
-        TASKS[Celery tasks]
-    end
-    subgraph APP[Application services]
-        ORCH[TradingOrchestrator]
-        MARKET[MarketService]
-        TRADE[TradingService]
-        PORT[PortfolioService]
-        STATE[SystemStateCaretaker]
-    end
-    subgraph DOMAIN[Domain]
-        MODELS[Pydantic entities]
-        AGENTS[Specialized agents]
-        STRATEGIES[Strategy registry]
-        METRICS[Indicators and risk metrics]
-    end
-    subgraph INFRA[Infrastructure]
-        EVENT[EventBus]
-        REPOSITORY[TradingRepository]
-        BROKER[Alpaca / simulated broker]
-        REASONING[Gemini / fallback]
-        CIRCUIT[CircuitBreaker]
-    end
-    INTERFACES --> APP
-    APP --> DOMAIN
-    APP --> INFRA
-    DOMAIN --> INFRA
-```
-
-### Responsibilities
-
-- `frontend/app/page.tsx` renders equity, performance, positions, market data, persistence counts, orchestrator state, and agent health.
-- `backend/api/main.py` is the composition root for adapters, agents, services, event subscriptions, and lifecycle resources.
-- `backend/api/websocket.py` manages real-time browser channels.
-- `backend/tasks/celery.py` defines periodic cycles and reconciliation.
-- `TradingOrchestrator` coordinates decisions, execution gates, learning, reconciliation, emergency stop, resume, and durable state.
-- `MarketService`, `TradingService`, and `PortfolioService` expose focused use cases.
-- `SystemStateCaretaker` atomically stores and restores a `SystemMemento`.
-
-Pydantic models provide validated messages: `MarketBar`, `MarketSnapshot`, `TradeSignal`, `RiskDecision`, `Order`, `Position`, `Portfolio`, `AgentStatus`, and `AgentEvent`. Enums constrain actions, order types, regimes, sources, and states.
-
-Strategies share one interface and are resolved through `StrategyRegistry`. Implementations are momentum, mean reversion, breakout, trend following, and swing. Infrastructure adapters isolate SQLAlchemy, Redis, Alpaca, Gemini, WebSocket, and failure handling from application logic.
-
-## 6. Agent architecture
-
-Every agent extends `BaseAgent[I, O]`, whose Template Method controls the lifecycle:
-
-```mermaid
-flowchart LR
-    INPUT[Typed input] --> STATE[State = processing]
-    STATE --> RUN[Bounded async processing]
-    RUN --> VALIDATE[Validate output]
-    VALIDATE --> METRICS[Update count and latency]
-    METRICS --> EVENT[Publish completion]
-    RUN -. exception .-> ERROR[Record and publish error]
-```
-
-| Agent | Responsibility | Output |
+| Runtime | Owns | Must not own |
 |---|---|---|
-| Data | Fetch Alpaca bars, optionally generate deterministic fallback data, calculate indicators, classify regime | `MarketSnapshot` with provenance |
-| Knowledge | Embed conditions and retrieve five similar scenarios through ChromaDB or JSONL fallback | Ranked scenarios |
-| CoT | Request an auditable Gemini Flash summary or use deterministic fallback | Regime, strategy recommendation, confidence, summary |
-| Strategy | Resolve selected/automatic strategy and create buy, sell, or hold | `TradeSignal` |
-| Risk | Check confidence, buying power, exposure, daily loss, Kelly sizing, VaR, and Sharpe | `RiskDecision` |
-| Execution | Submit an approved bracket-capable paper order and persist it | `Order` or no order |
-| RL | Infer with optional PPO or lightweight policy-gradient weights | Advisory policy |
-| Validation | Perform walk-forward evaluation | Backtest metrics |
+| Next.js frontend | Presentation state, polling, WebSocket connection, operator intent | Trading decisions or authoritative safety state |
+| FastAPI process | Composition root, orchestrator, agents, live WebSocket hub, API policy | Scheduling cadence |
+| Celery Beat | When cycles and reconciliation become due | Agent instances or trading state |
+| Celery worker | Redis locks and authenticated calls to the API | A second orchestrator |
+| TimescaleDB | Bars, indicators, events, locally known orders | Live broker truth |
+| Redis | Celery messages/results, cycle locks, capped event stream | Authoritative portfolio state |
+| Alpaca paper API | Account, positions, order acceptance, fills, market clock | Strategy selection |
+| HDD application volume | Memento, knowledge records, RL policies | Source code or secrets |
 
-RL output is advisory and cannot override the strategy/risk path. Learning runs after explicit feedback or when reconciliation detects a newly completed round trip. Weights use compressed NumPy storage, with optional PPO checkpoints.
+The broker is authoritative for account equity, open positions, order status, and fills. The database is the application's durable observation of that broker state.
 
-## 7. Trading-cycle sequence
+## 3. Container and process topology
+
+```mermaid
+flowchart LR
+    Browser[Browser]
+    Frontend[Next.js frontend]
+    API[FastAPI process]
+    Beat[Celery Beat]
+    Worker[Celery worker]
+    Redis[(Redis)]
+    DB[(TimescaleDB)]
+    Alpaca[Alpaca paper APIs]
+    Gemini[Gemini Flash]
+    HDD[(HDD app volume)]
+
+    Browser --> Frontend
+    Frontend -->|REST + WebSocket| API
+    Beat -->|enqueue| Redis
+    Redis -->|deliver task| Worker
+    Worker -->|internal authenticated HTTP| API
+    Worker -->|cycle lock| Redis
+    API --> DB
+    API -->|append vector:events| Redis
+    API --> Alpaca
+    API --> Gemini
+    API --> HDD
+```
+
+A scheduled job crosses the worker/API boundary by HTTP because the API process is the only owner of the orchestrator. Running agents directly inside worker processes would create separate copies of auto-trade, emergency-stop, cycle, and strategy state.
+
+## 4. Internal dependency direction
+
+```mermaid
+flowchart TB
+    Routes[API routes and WebSocket]
+    Tasks[Celery task adapter]
+    Services[Application services]
+    Orchestrator[TradingOrchestrator]
+    Agents[Agent interfaces and implementations]
+    Domain[Domain entities and exceptions]
+    Strategies[TradingStrategy implementations]
+    Ports[Broker, reasoning, event, repository capabilities]
+    Adapters[Alpaca, Gemini, SQLAlchemy, Redis adapters]
+
+    Routes --> Services
+    Routes --> Orchestrator
+    Tasks -->|HTTP only| Routes
+    Services --> Domain
+    Orchestrator --> Agents
+    Orchestrator --> Domain
+    Agents --> Strategies
+    Agents --> Domain
+    Agents --> Ports
+    Services --> Ports
+    Ports --> Adapters
+```
+
+The concrete wiring happens once in `backend/api/main.py`. High-level orchestration receives its dependencies through constructors. Business decisions do not import FastAPI or Celery.
+
+## 5. Core domain contracts
+
+These objects are the stable language between components:
+
+| Contract | Meaning | Important invariant |
+|---|---|---|
+| `MarketBar` | One OHLCV observation | Symbol is normalized and timestamped |
+| `MarketSnapshot` | Bars plus indicators, regime, timeframe, and provenance | Timeframe is 1-60 minutes; source is explicit |
+| `TradeSignal` | Strategy intent | Action, confidence, entry, stop, and target travel together |
+| `RiskDecision` | Approval and safe size | Execution may not invent a quantity |
+| `Order` | Local order representation | Quantity is positive; broker ID is added after acceptance |
+| `Portfolio` | Broker-derived account view | Broker remains authoritative |
+| `AgentEvent` | Observable lifecycle message | Includes source, topic, timestamp, correlation ID |
+| `OrderRejectedError` | Deterministic broker refusal | Must not be treated as provider downtime |
+
+Pydantic validation forms the boundary around external or computed values. Domain contracts are intentionally vendor-neutral; Alpaca wire constraints are applied only in the Alpaca adapter.
+
+## 6. Agent execution model
+
+```mermaid
+classDiagram
+    class BaseAgent {
+      +name
+      +status
+      +initialize()
+      +process(input)
+      +validate(output)
+      #_process(input)
+    }
+    class DataAgent
+    class KnowledgeAgent
+    class CoTAgent
+    class StrategyAgent
+    class RiskAgent
+    class ExecutionAgent
+    class RLAgent
+    class ValidationAgent
+
+    BaseAgent <|-- DataAgent
+    BaseAgent <|-- KnowledgeAgent
+    BaseAgent <|-- CoTAgent
+    BaseAgent <|-- StrategyAgent
+    BaseAgent <|-- RiskAgent
+    BaseAgent <|-- ExecutionAgent
+    BaseAgent <|-- RLAgent
+    BaseAgent <|-- ValidationAgent
+```
+
+`BaseAgent.process()` is the Template Method. It owns timeout enforcement, state transitions, validation, latency/counter updates, completion events, and error events. Subclasses own only their decision-specific `_process()`.
+
+Agents are independent components, but the trading pipeline is intentionally sequential because each stage consumes a validated result from the previous stage. Redis events provide observation and durability; they are not currently the command path between agents.
+
+
+## 7. Decision pipeline
 
 ```mermaid
 sequenceDiagram
-    participant T as UI or Celery
-    participant API as FastAPI
+    autonumber
+    participant Trigger as UI / scheduled task
     participant O as Orchestrator
-    participant D as Data
-    participant K as Knowledge
-    participant C as CoT
-    participant S as Strategy
-    participant R as Risk
-    participant E as Execution
-    participant RL as RL
-    participant DB as Repository
-    participant B as EventBus
-    T->>API: Run symbol/timeframe cycle
-    API->>O: run_cycle(execute)
-    O->>D: Fetch bars and indicators
-    D-->>O: Snapshot and source
-    O->>DB: Persist bars and indicators
-    O->>K: Retrieve similar scenarios
-    K-->>O: Ranked context
-    O->>C: Analyze context
-    C-->>O: Decision summary
-    O->>S: Generate signal
+    participant D as DataAgent
+    participant K as KnowledgeAgent
+    participant C as CoTAgent
+    participant S as StrategyAgent
+    participant R as RiskAgent
+    participant X as ExecutionAgent
+    participant RL as RLAgent
+    participant Repo as Repository
+    participant Broker as Alpaca
+
+    Trigger->>O: run_cycle(symbol, timeframe, execute)
+    O->>D: symbol, timeframe
+    D->>Broker: historical bars
+    Broker-->>D: Alpaca bars
+    D-->>O: MarketSnapshot
+    O->>Repo: upsert bars + indicators
+    O->>K: snapshot embedding
+    K-->>O: similar scenarios
+    O->>C: snapshot + scenarios
+    C-->>O: concise decision summary
+    O->>S: snapshot + recommendation
     S-->>O: TradeSignal
-    O->>R: Evaluate risk
+    O->>R: signal + portfolio + returns
     R-->>O: RiskDecision
-    alt execution requested and guards pass
-        O->>E: Submit paper order
-        E->>DB: Persist order
-        E-->>O: Broker order
-    else analysis-only or blocked
-        O-->>O: Record no-order reason
+    O->>O: execution guards
+    alt execution permitted and risk approved
+        O->>X: signal + approved quantity
+        X->>Broker: normalized paper bracket order
+        Broker-->>X: accepted order
+        X->>Repo: save local order
+    else analysis or blocked
+        O->>O: retain explicit no-order reason
     end
-    O->>RL: Infer advisory policy
-    RL-->>O: Action and confidence
-    O->>B: trading.cycle.completed
-    B->>DB: Persist event
-    O-->>API: Cycle result
-    API-->>T: JSON
+    O->>RL: snapshot
+    RL-->>O: advisory policy
+    O-->>Trigger: complete cycle result
 ```
 
-Agents execute sequentially because later stages require validated earlier outputs. They exchange typed values through the orchestrator and publish lifecycle events through the bus. Redis stores a durable event copy while local subscribers receive live events.
+### Stage contracts and authority
 
-## 8. Scheduling and automatic paper trading
+1. **Data** establishes provenance. Synthetic data may be analyzed but cannot be traded.
+2. **Knowledge** retrieves context. It cannot generate or authorize orders.
+3. **CoT** produces an auditable summary and strategy recommendation. It cannot size positions.
+4. **Strategy** produces intent. It cannot approve its own risk.
+5. **Risk** decides approval and maximum quantity. It cannot talk to Alpaca.
+6. **Execution** translates an approved domain order into Alpaca's paper-order format.
+7. **RL** observes and learns but is advisory; it cannot override Strategy or Risk.
+8. **Validation** is invoked for backtests, outside the live order path.
 
-Celery Beat derives schedules from `SCHEDULED_SYMBOLS`, `SCHEDULED_TIMEFRAMES`, and `CYCLE_SCHEDULE_SECONDS`. Each pair enqueues `trading.run_cycle`. A worker acquires Redis lock `vector:lock:cycle:{symbol}:{timeframe}` and calls the internal `scheduled-run` endpoint. Reconciliation runs every 60 seconds.
+This separation prevents a model response, a strategy bug, or an RL policy from directly placing an order.
+
+## 8. Operating-state machine
 
 ```mermaid
-flowchart LR
-    BEAT[Celery Beat] -->|Periodic task| REDIS[(Redis broker)]
-    REDIS --> WORKER[Celery worker]
-    WORKER -->|Per-symbol lock| LOCK[(Redis lock)]
-    WORKER -->|POST scheduled-run| API[FastAPI]
-    API --> ORCH[Orchestrator execute=true]
+stateDiagram-v2
+    [*] --> Analysis: first start / resume
+    Analysis: running=true
+    Analysis: auto_trade=false
+    AutoPaper: running=true
+    AutoPaper: auto_trade=true
+    Stopped: running=false
+    Stopped: emergency_stopped=true
+
+    Analysis --> AutoPaper: operator enables auto trade
+    AutoPaper --> Analysis: operator disables auto trade
+    Analysis --> Stopped: emergency stop
+    AutoPaper --> Stopped: emergency stop + cancel open orders
+    Stopped --> Analysis: resume
 ```
 
-Turning on auto trade persists execution permission; it does not force an immediate order. A scheduled cycle submits only if a strategy returns buy/sell, risk approves it, and every gate passes.
+The state is persisted atomically in `state/system.json`. Resume deliberately returns to analysis mode, so an emergency stop can never silently re-enable execution. A normal container restart restores the last state, including auto trade, unless the system was emergency-stopped.
 
-### Execution gates
+## 9. Execution invariants
+
+The orchestrator evaluates these invariants before calling the execution agent:
 
 ```mermaid
 flowchart TD
-    START[Scheduled execution request] --> AUTO{Auto trade enabled?}
-    AUTO -- No --> BLOCK[No order; return reason]
-    AUTO -- Yes --> STOP{Running and not stopped?}
-    STOP -- No --> BLOCK
-    STOP -- Yes --> SOURCE{Source is Alpaca?}
-    SOURCE -- No --> BLOCK
-    SOURCE -- Yes --> FRESH{Latest bar fresh?}
-    FRESH -- No --> BLOCK
-    FRESH -- Yes --> BROKER{Verified paper broker?}
-    BROKER -- No --> BLOCK
-    BROKER -- Yes --> OPEN{Market open?}
-    OPEN -- No --> BLOCK
-    OPEN -- Yes --> DUP{Open symbol order exists?}
-    DUP -- Yes --> BLOCK
-    DUP -- No --> RISK{Risk approved?}
-    RISK -- No --> BLOCK
-    RISK -- Yes --> ORDER[Submit Alpaca paper order]
+    Request[Execution requested] --> Auto{Auto trade enabled?}
+    Auto -- no --> Reject[No order + reason]
+    Auto -- yes --> Running{Running and not stopped?}
+    Running -- no --> Reject
+    Running -- yes --> Source{Verified Alpaca data?}
+    Source -- no --> Reject
+    Source -- yes --> Fresh{Latest bar within age limit?}
+    Fresh -- no --> Reject
+    Fresh -- yes --> Paper{Verified paper broker?}
+    Paper -- no --> Reject
+    Paper -- yes --> Open{Market open?}
+    Open -- no --> Reject
+    Open -- yes --> Duplicate{Open order for symbol?}
+    Duplicate -- yes --> Reject
+    Duplicate -- no --> Risk{Risk approved?}
+    Risk -- no --> Reject
+    Risk -- yes --> Submit[Normalize and submit]
 ```
 
-Emergency stop disables auto trade, stops the orchestrator, persists the state, and requests cancellation of open broker orders. Resume returns to analysis mode; auto trade must be enabled again.
+The Alpaca adapter adds final wire-level invariants:
 
-## 9. Persistence
+- The base URL must contain `paper-api`.
+- Bracket quantities are reduced to whole shares; rounding down cannot increase calculated exposure.
+- Bracket stop and take-profit prices follow Alpaca's minimum price variance.
+- Every application order receives a `vector-` client ID for ownership and reconciliation.
+- Deterministic Alpaca 4xx rejections become `OrderRejectedError`; they do not open the provider circuit or trigger a retry storm.
+- Transient transport and 5xx failures still participate in circuit breaking and Celery retry.
 
-| Store | Data | Durability and limits |
+## 10. Order lifecycle and reconciliation
+
+```mermaid
+stateDiagram-v2
+    [*] --> Proposed: strategy + risk
+    Proposed --> Blocked: execution guard fails
+    Proposed --> Submitted: normalized request sent
+    Submitted --> Rejected: deterministic broker rejection
+    Submitted --> Accepted: Alpaca accepts
+    Accepted --> Filled: entry fills
+    Accepted --> Cancelled: cancelled before fill
+    Filled --> Protected: bracket exit legs active
+    Protected --> Closed: take-profit or stop-loss fills
+    Closed --> Learned: reconciliation records new round trip
+```
+
+Alpaca is the source of truth. Every minute, reconciliation:
+
+1. fetches broker orders with nested bracket legs;
+2. ignores orders without the application's `vector-` client prefix;
+3. updates local broker IDs, statuses, fills, and bracket legs;
+4. reconstructs closed round trips and performance;
+5. invokes feedback learning once for each newly observed closed-trade count.
+
+This makes order submission and order observation separate concerns. A successful HTTP submission is not treated as proof of a fill.
+
+
+## 11. Event semantics
+
+```mermaid
+flowchart LR
+    Agent[Agent / service] -->|publish AgentEvent| Bus[In-process EventBus]
+    Bus -->|wildcard subscriber| EventRepo[(agent_events)]
+    Bus -->|capped append| Stream[(Redis vector:events)]
+    Bus -->|topic mapping| Hub[WebSocketHub]
+    Hub --> AgentsWS[agents channel]
+    Hub --> OrdersWS[orders channel]
+    Hub --> PerformanceWS[performance channel]
+    Hub --> AlertsWS[alerts channel]
+    QuoteLoop[Market quote loop] --> MarketWS[market channel]
+```
+
+There are two distinct guarantees:
+
+- **Local delivery:** current API subscribers receive an event immediately on a best-effort basis.
+- **Durable observation:** the event is copied to TimescaleDB and the capped Redis Stream.
+
+Redis Stream is not yet an agent command queue or replay source for WebSockets. Browser clients that disconnect receive fresh REST state and future events after reconnect, not missed-event replay.
+
+Topic routing is intentionally simple: `agent.*` goes to agents, order topics go to orders, trading completion topics go to performance, and unmatched events go to alerts. Market quotes use a dedicated broadcast loop.
+
+## 12. Data ownership and lifecycle
+
+```mermaid
+flowchart TB
+    AlpacaBars[Alpaca IEX bars] --> Snapshot[MarketSnapshot]
+    Synthetic[Synthetic fallback] --> Snapshot
+    Snapshot --> Indicators[Indicators + regime]
+    Snapshot --> MarketTable[(market_data)]
+    Indicators --> IndicatorTable[(indicator_values)]
+    Snapshot --> KnowledgeQuery[128-dimensional query]
+    Outcome[Closed-trade outcome] --> KnowledgeStore[(JSONL / ChromaDB)]
+    Outcome --> RLUpdate[RL update]
+    RLUpdate --> Policy[(NumPy / optional PPO)]
+    Events[AgentEvent] --> EventTable[(agent_events)]
+    Events --> RedisStream[(capped Redis Stream)]
+    BrokerOrders[Alpaca orders] --> Reconcile[Reconciliation]
+    Reconcile --> OrderTable[(orders)]
+```
+
+| Data | Authoritative owner | Retention behavior |
 |---|---|---|
-| TimescaleDB/PostgreSQL | Bars, indicators, events, local orders | HDD volume; bars use `(time, symbol)` identity |
-| Redis | Celery broker/results, locks, `vector:events` | HDD volume; event stream is approximately capped |
-| JSONL / ChromaDB | Similar scenarios and outcomes | `/data/knowledge`; fallback loads the latest 5,000 records |
-| NumPy / PPO | RL weights/checkpoint | `/data/models`; updated after learning |
-| JSON memento | Cycles, strategy, auto trade, stop flag, learned count | Atomic `/data/state/system.json` replacement |
+| Account and positions | Alpaca | Queried live |
+| Historical bars | Alpaca; synthetic only as labeled fallback | Upserted by time/symbol |
+| Indicators | Application | One set per fetched snapshot |
+| Agent events | Application | Relational history plus capped Redis copy |
+| Orders/fills | Alpaca, mirrored locally | Reconciled every minute |
+| Scenario memory | KnowledgeAgent | JSONL and optional ChromaDB on HDD |
+| RL policy | RLAgent | Compressed weights; optional PPO checkpoint |
+| Safety state | Orchestrator memento | Atomic latest-state file |
 
-`TradingRepository` hides database mechanics. Local development defaults to SQLite WAL; Docker overrides `DATABASE_URL` for TimescaleDB. ORM-managed runtime tables are `market_data`, `indicator_values`, `orders`, and `agent_events`. Initialization SQL also creates Timescale hypertables and extension-ready strategy/trade tables.
+Synthetic and Alpaca observations are never treated as equivalent: provenance travels in `MarketSnapshot` and becomes an execution invariant.
 
-Reconciliation fetches Alpaca orders, selects application-owned records with the `vector-` client prefix, updates local fills/status, persists bracket legs, recalculates performance, and triggers learning after a new closed trade.
+## 13. Concurrency, idempotency, and consistency
 
-## 10. API and real-time delivery
+### Scheduled concurrency
 
-REST groups cover health, market quotes/history, manual paper orders, portfolio/performance/statistics, agent status/strategy/backtests, and orchestrator controls. Protected routes require `X-API-Key` when configured. WebSockets use the `api_key` query parameter because browsers cannot add arbitrary WebSocket headers.
+Beat creates one task per configured symbol/timeframe. Before calling the API, a worker acquires:
 
-`/ws/{channel}` accepts `market`, `orders`, `agents`, `alerts`, or `performance`. The API broadcasts configured-symbol quotes to `market`. The dashboard reconnects, polls if the stream is stale, loads history on symbol changes, and refreshes account/system state every ten seconds.
+`vector:lock:cycle:{symbol}:{timeframe}`
 
-WebSocket delivery is live and in-memory. Redis Stream is durable event history, but the hub does not replay missed events after reconnection.
+The lock prevents the same cycle from overlapping across workers. Different symbols may run concurrently, bounded by worker concurrency.
 
-## 11. Design patterns and SOLID
+### Order idempotency
 
-| Pattern or principle | Implementation |
-|---|---|
-| Template Method | `BaseAgent.process()` owns timeout, validation, status, error, and events |
-| Strategy | Algorithms implement one interface and use `StrategyRegistry` |
-| Factory | `AgentFactory` constructs agents with injected dependencies |
-| Observer / Pub-Sub | `EventBus` delivers topic/wildcard events and writes Redis Stream |
-| Repository | `TradingRepository` isolates persistence |
-| Adapter | Alpaca, simulated broker, Gemini, database, Redis, WebSocket |
-| Command | Trading service encapsulates order placement/cancellation |
-| Memento | `SystemMemento` restores safety state |
-| Circuit Breaker | External provider failures are bounded |
-| Composition Root | `backend/api/main.py` wires concrete dependencies |
-| Single Responsibility | Each agent/service owns a narrow concern |
-| Open/Closed | Strategies and adapters can be extended |
-| Liskov Substitution | Broker/strategy implementations preserve contracts |
-| Interface Segregation | Consumers use focused provider capabilities |
-| Dependency Inversion | Orchestration receives its dependencies |
+Each order gets a stable client ID derived from its domain UUID. Repeating observation is safe because repository order writes merge by local ID. Reconciliation filters by the client prefix before importing broker state.
 
-## 12. Reliability, safety, and security
+A future stronger design should send the same client ID across retry attempts and query Alpaca by that ID before any resubmission when a network timeout leaves acceptance uncertain.
 
-- Non-paper Alpaca URLs are rejected.
-- Synthetic data can be analyzed but never auto-traded.
-- Agents have timeouts; Celery tasks have limits, retries, and backoff.
-- Redis locks prevent overlapping scheduled cycles.
-- Alpaca and Gemini use network timeouts and circuit breakers.
-- Orders use a `vector-` client prefix for reconciliation ownership.
-- Risk covers confidence, buying power, exposure, daily loss, stop distance, Kelly sizing, VaR, and Sharpe.
-- Auto-trade and emergency-stop state survive restarts.
-- Secrets load from ignored `.env`; tracked templates contain placeholders.
-- API controls include rate limiting, CORS, security headers, and optional API-key authentication.
-- `/health` checks database, Redis, disk, and memory; `/health/deep` also probes Alpaca and Gemini.
+### Consistency model
 
-## 13. Failure and fallback behavior
+The system is intentionally eventually consistent:
 
-| Failure | Behavior |
-|---|---|
-| Alpaca data unavailable | Optional deterministic synthetic data, explicit synthetic label, execution blocked |
-| Alpaca broker unavailable | Order prevented; scheduled task may retry |
-| Gemini unavailable | Deterministic regime fallback with provider/failure information |
-| ChromaDB unavailable | JSONL and NumPy similarity fallback |
-| Stable-Baselines3 unavailable | Lightweight policy-gradient fallback |
-| Redis stream write fails | Local delivery continues; health degrades until reconnect |
-| Database unavailable | Health degrades and persistence failures surface |
-| WebSocket disconnects | Browser reconnects while REST/quote polling continues |
-| Container restarts | Compose restarts services and restores HDD state |
+- Alpaca accepts/fills orders first.
+- Local order state follows during submission and reconciliation.
+- Portfolio always comes from Alpaca.
+- Dashboard REST polling corrects missed WebSocket updates.
+- Performance changes only after fills are mirrored locally.
 
-## 14. Current boundaries
+## 14. Failure containment
 
-- This is production-oriented for a controlled demo, not a regulated brokerage platform.
-- Automated execution is Alpaca paper-only.
-- EventBus delivery is in-process; Redis Stream is durable storage, not a distributed agent consumer-group workflow.
-- Agents are independent components in one API process, not separate microservices.
-- RL is advisory and cannot override deterministic strategy/risk decisions.
-- Performance is reconstructed from reconciled filled orders.
-- Rate limits and WebSocket sessions are process-local; horizontal scaling needs shared limits and Redis-backed fan-out.
-- Localhost binding assumes a trusted workstation. Internet exposure needs TLS, a reverse proxy, stronger access controls, managed secrets, and production monitoring.
+| Failure boundary | Containment behavior | Remaining service |
+|---|---|---|
+| Gemini quota/outage | Deterministic regime recommendation | Analysis continues |
+| ChromaDB unavailable | JSONL + NumPy similarity | Knowledge retrieval continues |
+| Stable-Baselines3 unavailable | Lightweight policy-gradient policy | RL inference/learning continues |
+| Alpaca history unavailable | Labeled synthetic data if enabled | Analysis only; execution blocked |
+| Alpaca order 4xx | Explicit no-order reason, no retry storm | Later cycles continue |
+| Alpaca/network 5xx | Timeout, circuit breaker, task retry | Failure remains observable |
+| Redis stream append fails | Local delivery continues; health degrades | API can still process current event |
+| WebSocket disconnect | Dead socket removed; browser reconnects and polls | Trading is unaffected |
+| Database failure | Health degrades; durable operations fail visibly | No false persistence success |
+| Emergency stop | Auto trade disabled and open orders cancelled | Analysis resumes only after operator action |
 
-## 15. Repository map
+Failure handling favors safe non-execution. Fallback reasoning or data can never silently weaken the execution gates.
 
-```text
-trading-app/
-|-- backend/
-|   |-- agents/              # Base, factory, specialized agents
-|   |-- api/                 # REST and WebSocket adapters
-|   |-- infrastructure/      # Event bus and circuit breaker
-|   |-- models/              # Domain entities and DTOs
-|   |-- services/            # Orchestration and use cases
-|   |-- storage/             # External and database adapters
-|   |-- strategies/          # Strategies and registry
-|   |-- tasks/               # Celery tasks and schedules
-|   |-- tests/               # Automated tests
-|   `-- utils/               # Settings, indicators, risk metrics
-|-- frontend/                # Next.js dashboard
-|-- infrastructure/docker/   # Images and database initialization
-|-- scripts/                 # Setup, startup, backup utilities
-|-- docs/                    # Architecture and audit artifacts
-|-- docker-compose.yml       # Deployment topology
-|-- .env.example             # Safe configuration template
-`-- README.md                # Setup and operations
-```
+## 15. Architectural decisions
 
-## 16. Extension guidance
+### ADR-001: Modular monolith before agent microservices
 
-To add a strategy, implement the shared interface, return a valid `TradeSignal`, register it, and add deterministic tests. To add a broker or reasoning provider, implement its focused capabilities and inject the adapter at the composition root.
+**Decision:** Keep agents in one API process.
 
-To distribute agents, retain domain messages and lifecycle semantics while replacing direct calls with acknowledged Redis consumer groups or another transport. Add idempotency, dead-letter handling, replay rules, and trace propagation.
+**Reason:** The pipeline is dependency-ordered, throughput is low, and one owner for safety state is more valuable than independent deployment.
 
-Any order-capable extension must preserve the paper-only invariant and execution-gate ordering unless the system is deliberately redesigned with separate authorization, compliance, audit, and production controls.
+**Trade-off:** Agent scaling and failure isolation are process-level rather than service-level.
+
+### ADR-002: API-owned orchestration
+
+**Decision:** Workers trigger the orchestrator through internal HTTP.
+
+**Reason:** Importing API globals into Celery would create another object graph and contradictory state.
+
+**Trade-off:** Scheduled cycles depend on API availability.
+
+### ADR-003: Paper-only broker invariant
+
+**Decision:** Reject non-paper Alpaca URLs in the adapter.
+
+**Reason:** A configuration mistake must not convert a demo system into live trading.
+
+**Trade-off:** Live deployment requires deliberate architectural and authorization work, not a flag change.
+
+### ADR-004: Deterministic strategy/risk execution path
+
+**Decision:** Gemini recommends a strategy and RL remains advisory.
+
+**Reason:** Model output should not directly authorize broker actions.
+
+**Trade-off:** Learning cannot autonomously replace deterministic policy.
+
+### ADR-005: Broker truth with local reconciliation
+
+**Decision:** Read portfolio from Alpaca and mirror fills locally.
+
+**Reason:** Local submission state cannot prove exchange simulation outcomes.
+
+**Trade-off:** UI performance metrics lag until reconciliation.
+
+### ADR-006: Dual event persistence
+
+**Decision:** Use relational event history plus a capped Redis Stream.
+
+**Reason:** SQL supports audit queries; Redis supports inexpensive recent operational inspection.
+
+**Trade-off:** They are duplicate observations and not a transactional outbox.
+
+## 16. Safe extension points
+
+### Add a strategy
+
+Implement `TradingStrategy.generate(snapshot)`, return a valid `TradeSignal`, register it, and add deterministic tests. Do not add broker access to a strategy.
+
+### Add a broker
+
+Implement history, portfolio, clock, submit/cancel, list, and health capabilities. Preserve provenance, idempotency, explicit rejection types, and the paper-only boundary unless a separately governed system is designed.
+
+### Distribute agents
+
+Replace direct stage calls with acknowledged messages only if independent scaling is justified. The distributed design would also require:
+
+- idempotency keys per stage;
+- schema versioning;
+- consumer groups and dead-letter queues;
+- correlation/trace propagation;
+- replay rules;
+- ordering guarantees;
+- centralized safety-state ownership.
+
+### Scale the API
+
+Before running multiple API replicas, move rate limiting and WebSocket fan-out to shared infrastructure and make orchestrator state transactional or single-leader. The current in-memory hub and orchestrator intentionally assume one API replica.
+
+## 17. Technical debt and next architectural work
+
+1. Add a transactional outbox so database state and event publication cannot diverge.
+2. Store explicit cycle records, including no-order reasons, instead of reconstructing them from events.
+3. Add broker-order lookup by client ID before retrying uncertain submissions.
+4. Add Redis-backed WebSocket fan-out and replay cursors if horizontal scaling is needed.
+5. Add retention/compression policies for Timescale hypertables.
+6. Persist richer RL training metadata and model version lineage.
+7. Separate provider quota state from generic agent health in the UI.
+8. Run containers as non-root after defining HDD volume ownership.
+9. Add end-to-end contract tests against an isolated Alpaca paper account.
+10. Add OpenTelemetry traces using the existing event correlation ID.
+
+These are evolution points, not hidden claims about current behavior. The diagrams and decisions above describe the implementation as it exists now.

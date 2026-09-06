@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from backend.models.domain.entities import AgentEvent, MarketDataSource
+from backend.models.domain.entities import AgentEvent, MarketDataSource, Order, OrderType, Side
 from backend.models.domain.exceptions import OrderRejectedError
 from backend.services.system_state import SystemStateCaretaker
 
@@ -52,6 +52,9 @@ class TradingOrchestrator:
         if not clock.get("is_open", False): return False, "Alpaca reports that the market is closed"
         open_orders = await self.broker.list_orders(status="open", limit=100)
         if any(item.get("symbol") == snapshot.symbol for item in open_orders): return False, "an open broker order already exists for this symbol"
+        portfolio = await self.broker.get_portfolio()
+        if any(position.symbol == snapshot.symbol and abs(position.quantity) > 0 for position in portfolio.positions):
+            return False, "a broker position already exists for this symbol"
         return True, "execution safety checks passed"
 
     async def run_cycle(self, symbol: str, timeframe: int = 15, execute: bool = False) -> dict:
@@ -90,6 +93,39 @@ class TradingOrchestrator:
         await self.bus.publish(AgentEvent(topic="trading.learning.completed", source="orchestrator", payload=result))
         return result
 
+    async def repair_protection(self) -> dict:
+        """Restore exact stored exits for open positions that have no active broker order."""
+        if not self.broker or getattr(self.broker, "is_simulated", True):
+            raise RuntimeError("verified Alpaca paper broker is required")
+        remote_orders = await self.broker.list_orders(status="all", limit=500)
+        active_statuses = {"new", "accepted", "pending_new", "partially_filled", "held"}
+        active_symbols: set[str] = set()
+        for item in remote_orders:
+            if item.get("status") in active_statuses:
+                active_symbols.add(str(item.get("symbol")))
+            for leg in item.get("legs") or []:
+                if leg.get("status") in active_statuses:
+                    active_symbols.add(str(leg.get("symbol")))
+        portfolio = await self.broker.get_portfolio()
+        local_orders = await self.repository.list_orders(limit=5000)
+        protected: list[str] = []
+        missing_prices: list[str] = []
+        for position in portfolio.positions:
+            if abs(position.quantity) == 0 or position.symbol in active_symbols:
+                continue
+            entry_side = Side.BUY.value if position.quantity > 0 else Side.SELL.value
+            source = next((item for item in local_orders if item.get("symbol") == position.symbol and item.get("side") == entry_side and item.get("stop_loss") is not None and item.get("take_profit") is not None), None)
+            if source is None:
+                missing_prices.append(position.symbol)
+                continue
+            exit_order = Order(symbol=position.symbol, side=Side.SELL if position.quantity > 0 else Side.BUY, quantity=abs(position.quantity), order_type=OrderType.LIMIT, stop_loss=float(source["stop_loss"]), take_profit=float(source["take_profit"]), strategy="protection_recovery", data_source=MarketDataSource.ALPACA)
+            exit_order = await self.broker.submit_protective_order(exit_order)
+            await self.repository.save_order(exit_order)
+            protected.append(position.symbol)
+        result = {"protected": sorted(protected), "already_protected": sorted(active_symbols), "missing_prices": sorted(missing_prices)}
+        await self.bus.publish(AgentEvent(topic="trading.protection.repaired", source="orchestrator", payload=result))
+        return result
+
     async def reconcile(self) -> dict:
         remote_orders = await self.broker.list_orders() if self.broker else []
         updated = 0
@@ -100,7 +136,6 @@ class TradingOrchestrator:
             match = next((order for order in local_orders if order.get("client_order_id") == client_id), None)
             if not match: continue
             match.update({"broker_id": item.get("id"), "status": item.get("status", match["status"]), "filled_price": float(item["filled_avg_price"]) if item.get("filled_avg_price") else match.get("filled_price")})
-            from backend.models.domain.entities import Order, Side
             from uuid import NAMESPACE_URL, uuid5
             await self.repository.save_order(Order.model_validate(match)); updated += 1
             for leg in item.get("legs") or []:
@@ -110,7 +145,27 @@ class TradingOrchestrator:
         if performance["closed_trades"] > self.learned_closed_trades and self.last_snapshot:
             await self.record_outcome(float(performance["total_return"]), float(performance["sharpe_ratio"]), float(performance["win_rate"]), float(performance["max_drawdown"]))
             self.learned_closed_trades = int(performance["closed_trades"]); self._save_state()
-        result = {"broker_orders": len(remote_orders), "updated": updated, "closed_trades": performance["closed_trades"], "learned_closed_trades": self.learned_closed_trades}
+        unprotected_positions: list[str] = []
+        if self.broker and not getattr(self.broker, "is_simulated", True):
+            portfolio = await self.broker.get_portfolio()
+            active_statuses = {"new", "accepted", "pending_new", "partially_filled", "held"}
+            active_symbols: set[str] = set()
+            for item in remote_orders:
+                if item.get("status") in active_statuses:
+                    active_symbols.add(str(item.get("symbol")))
+                for leg in item.get("legs") or []:
+                    if leg.get("status") in active_statuses:
+                        active_symbols.add(str(leg.get("symbol")))
+            unprotected_positions = sorted(
+                position.symbol
+                for position in portfolio.positions
+                if abs(position.quantity) > 0 and position.symbol not in active_symbols
+            )
+            if unprotected_positions and self.auto_trade:
+                # Fail closed instead of pyramiding into a holding whose exits are missing.
+                self.auto_trade = False
+                self._save_state()
+        result = {"broker_orders": len(remote_orders), "updated": updated, "closed_trades": performance["closed_trades"], "learned_closed_trades": self.learned_closed_trades, "unprotected_positions": unprotected_positions, "auto_trade_disabled": bool(unprotected_positions)}
         await self.bus.publish(AgentEvent(topic="trading.reconciliation.completed", source="orchestrator", payload=result))
         return result
 

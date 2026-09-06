@@ -5,7 +5,7 @@ import pytest
 
 from backend.agents.factory import AgentFactory
 from backend.infrastructure.event_bus import EventBus
-from backend.models.domain.entities import MarketDataSource, Order, Side, utc_now
+from backend.models.domain.entities import MarketDataSource, Order, Position, Side, utc_now
 from backend.services.orchestrator import TradingOrchestrator
 from backend.services.portfolio_service import PortfolioService
 from backend.services.system_state import SystemStateCaretaker
@@ -81,8 +81,40 @@ async def test_alpaca_submission_uses_idempotency_and_bracket_exits(monkeypatch)
     assert order.quantity == 5
     assert captured["payload"]["qty"] == "5.0"
     assert captured["payload"]["order_class"] == "bracket"
+    assert captured["payload"]["time_in_force"] == "gtc"
     assert captured["payload"]["stop_loss"]["stop_price"] == "99.12"
     assert captured["payload"]["take_profit"]["limit_price"] == "103.99"
+
+
+@pytest.mark.asyncio
+async def test_alpaca_protective_order_uses_gtc_oco(monkeypatch):
+    client = AlpacaBrokerClient("key", "secret")
+    captured = {}
+    async def fake_request(method, path, **kwargs):
+        captured.update({"method": method, "path": path, "payload": kwargs["json"]})
+        return {"id": "protect-1", "status": "accepted"}
+    monkeypatch.setattr(client, "_request", fake_request)
+    order = await client.submit_protective_order(Order(symbol="AAPL", side=Side.BUY, quantity=5, stop_loss=322.96, take_profit=316.23))
+    assert order.broker_id == "protect-1"
+    assert captured["payload"]["order_class"] == "oco"
+    assert captured["payload"]["time_in_force"] == "gtc"
+    assert captured["payload"]["type"] == "limit"
+    assert captured["payload"]["side"] == "buy"
+
+
+@pytest.mark.asyncio
+async def test_execution_guard_rejects_an_existing_position(tmp_path: Path):
+    orchestrator, repository, broker = await build_system(tmp_path)
+    broker.is_simulated = False
+    broker.portfolio.positions = [Position(symbol="AAPL", quantity=-5, average_price=320, current_price=319)]
+    orchestrator.auto_trade = True
+    snapshot = await orchestrator.agents["data"].process({"symbol": "AAPL", "timeframe": 15})
+    snapshot.source = MarketDataSource.ALPACA
+    snapshot.bars[-1].timestamp = utc_now()
+    allowed, reason = await orchestrator._execution_guard(snapshot)
+    assert allowed is False
+    assert reason == "a broker position already exists for this symbol"
+    await repository.close()
 
 
 def test_alpaca_price_respects_minimum_price_variance():

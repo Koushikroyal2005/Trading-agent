@@ -15,6 +15,7 @@ from backend.agents.factory import AgentFactory
 from backend.api.websocket import WebSocketHub, websocket_loop
 from backend.infrastructure.event_bus import EventBus
 from backend.models.domain.entities import Order
+from backend.models.domain.exceptions import OrderRejectedError
 from backend.models.dto.requests import AutoTradeRequest, CycleRequest, OrderRequest, StrategySelectionRequest, TradeFeedbackRequest
 from backend.services.market_service import MarketService
 from backend.services.orchestrator import TradingOrchestrator
@@ -190,6 +191,12 @@ async def scheduled_run(request: CycleRequest):
 
 @app.post("/api/v1/orchestrator/reconcile", dependencies=[Depends(authenticate)])
 async def reconcile(): return await orchestrator.reconcile()
+
+
+@app.post("/api/v1/orchestrator/repair-protection", dependencies=[Depends(authenticate)])
+async def repair_protection():
+    try: return await orchestrator.repair_protection()
+    except (RuntimeError, OrderRejectedError) as error: raise HTTPException(409, str(error)) from error
 
 
 @app.post("/api/v1/orchestrator/feedback", dependencies=[Depends(authenticate)])

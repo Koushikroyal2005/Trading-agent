@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 
 from backend.infrastructure.circuit_breaker import CircuitBreaker
-from backend.models.domain.entities import MarketBar, Order, Portfolio, Position
+from backend.models.domain.entities import MarketBar, Order, OrderType, Portfolio, Position
 from backend.models.domain.exceptions import OrderRejectedError
 
 
@@ -113,7 +113,11 @@ class AlpacaBrokerClient:
             if whole_quantity < 1:
                 raise OrderRejectedError("Alpaca bracket orders require at least one whole share")
             order.quantity = float(whole_quantity)
-        payload = {"symbol": order.symbol, "qty": str(order.quantity), "side": order.side.value, "type": order.order_type.value, "time_in_force": "day", "client_order_id": order.client_order_id}
+        # Bracket exits must survive the closing auction. A DAY bracket leaves
+        # an overnight position unprotected after Alpaca expires its child
+        # orders, so use GTC whenever protective exits are attached.
+        time_in_force = "gtc" if is_bracket else "day"
+        payload = {"symbol": order.symbol, "qty": str(order.quantity), "side": order.side.value, "type": order.order_type.value, "time_in_force": time_in_force, "client_order_id": order.client_order_id}
         if order.limit_price is not None: payload["limit_price"] = alpaca_price(order.limit_price)
         if order.stop_price is not None: payload["stop_price"] = alpaca_price(order.stop_price)
         if is_bracket:
@@ -122,6 +126,32 @@ class AlpacaBrokerClient:
         order.broker_id = str(data["id"])
         order.status = str(data.get("status", "accepted"))
         order.filled_price = float(data["filled_avg_price"]) if data.get("filled_avg_price") else None
+        return order
+
+    async def submit_protective_order(self, order: Order) -> Order:
+        """Submit a GTC OCO exit for an already-open whole-share position."""
+        if order.stop_loss is None or order.take_profit is None:
+            raise ValueError("protective orders require both stop-loss and take-profit prices")
+        whole_quantity = floor(order.quantity)
+        if whole_quantity < 1:
+            raise OrderRejectedError("Alpaca OCO orders require at least one whole share")
+        order.quantity = float(whole_quantity)
+        order.order_type = OrderType.LIMIT
+        order.client_order_id = order.client_order_id or f"vector-protect-{uuid4().hex[:20]}"
+        payload = {
+            "symbol": order.symbol,
+            "qty": str(order.quantity),
+            "side": order.side.value,
+            "type": "limit",
+            "time_in_force": "gtc",
+            "order_class": "oco",
+            "take_profit": {"limit_price": alpaca_price(order.take_profit)},
+            "stop_loss": {"stop_price": alpaca_price(order.stop_loss)},
+            "client_order_id": order.client_order_id,
+        }
+        data = await self._request("POST", "orders", json=payload)
+        order.broker_id = str(data["id"])
+        order.status = str(data.get("status", "accepted"))
         return order
 
     async def cancel_order(self, order_id: str) -> bool:
